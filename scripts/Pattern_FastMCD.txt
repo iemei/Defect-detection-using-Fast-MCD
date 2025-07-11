@@ -1,0 +1,148 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.measure import label, regionprops
+
+# Reload pattern.png
+img = cv2.imread("pattern.png", cv2.IMREAD_GRAYSCALE)
+h, w = img.shape
+M = N = 2
+kh, kw = h // M, w // N
+H, W = 2 * h, 2 * w
+
+P_big = np.zeros((2*h - kh, 2*w - kw), np.uint8)
+
+def cosine_similarity(im, ker):
+    f_im, f_ker = im.astype(np.float32), ker.astype(np.float32)
+    num = cv2.filter2D(f_im, -1, f_ker[::-1, ::-1])
+    den = cv2.filter2D(f_im**2, -1, np.ones_like(ker, np.float32))
+    den = np.sqrt(den * np.sum(f_ker**2));  den[den == 0] = 1
+    return num / den
+
+for grid_i in range(M):
+    for grid_j in range(N):
+        top, left = grid_i * kh, grid_j * kw
+        ker = img[top:top + kh, left:left + kw]
+        CS = cosine_similarity(img, ker)
+        Pi = (CS > 0.85 + 0.15 * CS.min()).astype(np.uint8)
+        dst_y, dst_x = grid_i * kh, grid_j * kw
+        dst_y1 = min(dst_y + h, 2*h - kh)
+        dst_x1 = min(dst_x + w, 2*w - kw)
+        src_y1 = dst_y1 - dst_y
+        src_x1 = dst_x1 - dst_x
+        P_big[dst_y:dst_y1, dst_x:dst_x1] |= Pi[0:src_y1, 0:src_x1]
+
+centre = np.array([P_big.shape[1]//2, P_big.shape[0]//2])
+peaks = []
+for reg in regionprops(label(P_big)):
+    if reg.area >= 5:
+        y, x = reg.centroid
+        peaks.append(np.array([x, y]))
+peaks = np.array(peaks)
+
+directions = []
+for p in peaks:
+    v = p - centre
+    if np.linalg.norm(v) < 2:
+        continue
+    v = v / np.linalg.norm(v)
+    count = sum(abs(np.cross(np.append(v, 0), np.append(q - centre, 0))[2]) < 1.0 for q in peaks)
+    directions.append((count, v))
+
+directions.sort(key=lambda x: -x[0])
+w1 = directions[0][1]
+
+def cross_2d(u, v):
+    return u[0] * v[1] - u[1] * v[0]
+
+w2 = next(v for c, v in directions[1:] if abs(cross_2d(w1, v)) > 0.01)
+
+# Create (2h, 2w) lattice point canvas
+lattice_canvas = np.zeros((2*h, 2*w), np.uint8)
+origin = np.array([w, h])
+for i in range(-10, 11):
+    for j in range(-10, 11):
+        point = np.round(origin + i * w1 * kh + j * w2 * kw).astype(int)
+        if 0 <= point[1] < 2*h and 0 <= point[0] < 2*w:
+            lattice_canvas[point[1], point[0]] = 255
+
+# Overlap img onto lattice points
+P_overlap = np.zeros((2*h, 2*w), np.float32)
+count_mask = np.zeros((2*h, 2*w), np.uint8)
+
+for y in range(2*h):
+    for x in range(2*w):
+        if lattice_canvas[y, x]:
+            y0, y1 = y, y + h
+            x0, x1 = x, x + w
+            if y1 <= 2*h and x1 <= 2*w:
+                P_overlap[y0:y1, x0:x1] += img
+                count_mask[y0:y1, x0:x1] += 1
+
+count_mask[count_mask == 0] = 1
+P_ov_avg = P_overlap / count_mask
+
+P_col = cv2.cvtColor((P_big*255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+cv2.line(P_col, (int(centre[0]-w1[0]*300), int(centre[1]-w1[1]*300)),
+         (int(centre[0]+w1[0]*300), int(centre[1]+w1[1]*300)), (0,255,255), 2)
+cv2.line(P_col, (int(centre[0]-w2[0]*300), int(centre[1]-w2[1]*300)),
+         (int(centre[0]+w2[0]*300), int(centre[1]+w2[1]*300)), (0,255,0), 2)
+cv2.circle(P_col, tuple(centre), 4, (0,0,255), -1)
+
+Pd = P_ov_avg[h-h//2+25:2*h-h//2+25, w-w//2+13:2*w-w//2+13].astype(np.uint8)
+
+# Compute flattened image mask and overlay
+flattened = cv2.absdiff(img, Pd)
+flattened_smooth = cv2.GaussianBlur(flattened, (15, 15), 1)
+
+input_colored = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+# Threshold the flattened mask to create binary defect regions
+mask_threshold = (flattened_smooth > 70).astype(np.uint8) * 255
+
+# Find contours
+contours, _ = cv2.findContours(mask_threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+# Draw contours on the input image in yellow
+cv2.drawContours(input_colored, contours, -1, (0, 0, 255), thickness=2)
+
+
+fig, axs = plt.subplots(2, 4, figsize=(14, 8))
+
+axs[0, 0].imshow(img, cmap='gray')
+axs[0, 0].set_title("Input Image")
+axs[0, 0].axis('off')
+
+axs[0, 1].imshow(P_big, cmap='gray')
+axs[0, 1].set_title("Repeated Region Mask ")
+axs[0, 1].axis('off')
+
+axs[0, 2].imshow(P_col[..., ::-1])
+axs[0, 2].set_title("Lattice Vectors")
+axs[0, 2].axis('off')
+
+axs[0, 3].imshow(P_overlap, cmap='gray')
+axs[0, 3].set_title("Overlapping (2h, 2w)")
+axs[0, 3].axis('off')
+
+axs[1, 0].imshow(P_ov_avg, cmap='gray')
+axs[1, 0].set_title("Averaging")
+axs[1, 0].axis('off')
+
+axs[1, 1].imshow(Pd, cmap='gray')
+axs[1, 1].set_title("Defect-Free Image")
+axs[1, 1].axis('off')
+
+axs[1, 2].imshow(flattened_smooth, cmap='gray')
+axs[1, 2].set_title("Flattened Image")
+axs[1, 2].axis('off')
+
+axs[1, 3].imshow(input_colored[..., ::-1])
+axs[1, 3].set_title("Defect detection")
+axs[1, 3].axis('off')
+
+
+
+plt.tight_layout()
+plt.show()
+
